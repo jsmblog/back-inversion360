@@ -9,13 +9,24 @@ export const PropuestaPortafolio = sequelize.define(
       defaultValue: DataTypes.UUIDV4,
       primaryKey: true,
     },
-    perfil_id: { type: DataTypes.UUID, allowNull: false },
-    instrumentos: { type: DataTypes.JSON, allowNull: false }, 
+    perfil_id: {
+      type: DataTypes.UUID,
+      allowNull: false,
+      references: {
+        model: 'perfiles_inversionista',
+        key: 'id'
+      }
+    },
+    instrumentos: { type: DataTypes.JSON, allowNull: false },
     riesgo_esperado: { type: DataTypes.STRING, allowNull: false },
-    explicacion: { type: DataTypes.TEXT, allowNull: true },
-    version_reglas: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 1 },
-    estado: { type: DataTypes.ENUM("pendiente", "aprobada", "rechazada", "editada"), defaultValue: "pendiente" },
-    fecha_creacion: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
-  },
-  { tableName: "propuestas_portafolio", timestamps: true }
+    estado: {
+      type: DataTypes.ENUM('pendiente', 'aprobada', 'rechazada', 'editada'),
+      defaultValue: 'pendiente'
+    },
+    justificacion: { type: DataTypes.TEXT, allowNull: true },
+    version_reglas: { type: DataTypes.STRING, allowNull: true, defaultValue: 'v1.0.0' },
+  }, {
+    tableName: 'propuestas_portafolio',
+    timestamps: true
+  }
 );

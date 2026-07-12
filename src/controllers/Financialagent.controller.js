@@ -2,7 +2,7 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
 import { v4 as uuidv4 } from "uuid";
 import { sequelize } from "../config/database.js";
-import { Mensaje, ContextoUsuario, User, PerfilInversionista, PropuestaPortafolio } from "../models/relations.js";
+import { Mensaje, ContextoUsuario, User, PerfilInversionista, PropuestaPortafolio, PropuestaRevision } from "../models/relations.js";
 import { execute } from "../ai/execute.js";
 import { validarQuerySegura } from "../utils/sqlguard.js";
 import { calcularPerfil, generarPropuesta } from "../utils/perfilamiento.js";
@@ -106,7 +106,6 @@ export const enviarMensaje = async (req, res) => {
       contenido: m.contenido,
     }));
 
-    // ================= FLUJO ANÓNIMO: REGISTRO =================
     if (!req.user) {
       let datos_parciales = req.session.datos_registro || null;
 
@@ -203,8 +202,6 @@ export const enviarMensaje = async (req, res) => {
           { where: { propietario_id: ownerId } }
         );
 
-        // Emite JWT igual que en login para que el frontend lo guarde y lo
-        // mande en el header Authorization desde el siguiente mensaje.
         const token = jwt.sign(
           { id: newUser.id, email: newUser.email, rol: newUser.rol },
           process.env.JWT_SECRET,
@@ -219,8 +216,6 @@ export const enviarMensaje = async (req, res) => {
           intencion_pendiente: null,
         });
 
-        // Crea la sesión de agente ya en fase "perfilamiento" (esto también
-        // crea la fila 1:1 en AgentSessionContext, vacía y lista).
         const sesionNueva = await obtenerOCrearSesion(newUser.id);
         await registrarEvento(sesionNueva, "usuario_registrado", { email: newUser.email });
 
@@ -263,7 +258,6 @@ export const enviarMensaje = async (req, res) => {
       return res.status(422).json({ ok: false, mensaje: "Acción no reconocida por el módulo de registro." });
     }
 
-    // ================= FLUJO AUTENTICADO =================
     const user = req.user;
     const [contexto] = await ContextoUsuario.findOrCreate({
       where: { user_id: user.id },
@@ -273,7 +267,6 @@ export const enviarMensaje = async (req, res) => {
     const sesion = await obtenerOCrearSesion(user.id);
     const resumen_estado = await resumenEstado(sesion);
 
-    // ---- FASE: PERFILAMIENTO ----
     if (sesion.tarea === "perfilamiento") {
       const contextoSesion = await obtenerContexto(sesion);
       const respuestas_parciales = {
@@ -284,7 +277,6 @@ export const enviarMensaje = async (req, res) => {
         ingresos: contextoSesion.ingresos,
         experiencia: contextoSesion.experiencia,
       };
-      // No mandamos claves nulas al prompt, para no confundir al modelo.
       Object.keys(respuestas_parciales).forEach((k) => {
         if (respuestas_parciales[k] === null || respuestas_parciales[k] === undefined) {
           delete respuestas_parciales[k];
@@ -327,75 +319,90 @@ export const enviarMensaje = async (req, res) => {
       });
 
       if (!perfil_completado) {
-        // Antes: merge de un JSON libre sin límite. Ahora: solo se
-        // escriben los campos tipados que el modelo haya devuelto; el
-        // resto de las respuestas ya guardadas quedan intactas sin
-        // necesidad de "traerlas y volver a mandarlas".
         if (respuestas && Object.keys(respuestas).length > 0) {
           try {
             await actualizarContexto(sesion, respuestas);
           } catch (err) {
-            // Un valor fuera de rango (p. ej. texto más largo del permitido
-            // en una columna) ya no puede tumbar toda la sesión: se loguea
-            // y la conversación sigue. En el peor caso, esa respuesta
-            // puntual no quedó guardada y se le vuelve a preguntar.
             console.error("[AgentSessionContext] No se pudo guardar respuesta parcial:", err.message);
           }
         }
-        return res.status(200).json({ ok: true, respuesta, fase: "perfilamiento", sugerencias });
+        return res.status(200).json({
+          ok: true,
+          respuesta,
+          fase: "perfilamiento",
+          sugerencias,
+        });
       }
 
-      // Perfil completo: calcular score con reglas (no con IA) y crear propuesta
-      const { score, perfil, version } = calcularPerfil(respuestas);
-      const perfilCreado = await PerfilInversionista.create({
-        user_id: user.id,
-        ...respuestas,
-        score,
-        perfil,
-        version_reglas: version,
-      });
+      const camposRequeridos = ["edad", "objetivo", "horizonte", "tolerancia_perdida", "ingresos", "experiencia"];
+      const faltantes = camposRequeridos.filter(campo => !respuestas[campo]);
+      if (faltantes.length > 0) {
+        console.error("[Perfilamiento] Faltan campos:", faltantes);
+        return res.status(422).json({
+          ok: false,
+          mensaje: "La IA no devolvió todos los datos necesarios para el perfil.",
+          detalle: `Faltan: ${faltantes.join(", ")}`,
+          raw: perfilResult.raw,
+        });
+      }
 
-      const propuestaCalculada = generarPropuesta(perfil);
-      const propuestaCreada = await PropuestaPortafolio.create({
-        perfil_id: perfilCreado.id,
-        ...propuestaCalculada,
-      });
+      try {
+        const { score, perfil, version } = calcularPerfil(respuestas);
+        const perfilCreado = await PerfilInversionista.create({
+          user_id: user.id,
+          ...respuestas,
+          score,
+          perfil,
+          version_reglas: version,
+        });
 
-      await avanzarFase(sesion, "propuesta", {
-        perfil_id: perfilCreado.id,
-        propuesta_id: propuestaCreada.id,
-      });
-      await registrarEvento(sesion, "perfil_calculado", { perfil, score });
+        const propuestaCalculada = generarPropuesta(perfil);
+        const propuestaCreada = await PropuestaPortafolio.create({
+          perfil_id: perfilCreado.id,
+          ...propuestaCalculada,
+          estado: "pendiente",
+          version_reglas: version,
+        });
 
-      const respuestaFinal = `${respuesta} Tu perfil calculado es "${perfil}". Ya generé una propuesta preliminar de portafolio, ¿quieres verla?`;
+        await avanzarFase(sesion, "propuesta", {
+          perfil_id: perfilCreado.id,
+          propuesta_id: propuestaCreada.id,
+        });
+        await registrarEvento(sesion, "perfil_calculado", { perfil, score });
 
-      await Mensaje.create({
-        propietario_id: user.id,
-        user_id: user.id,
-        rol: "assistant",
-        contenido: respuestaFinal,
-        indice_orden: totalMensajes + 2,
-      });
+        const respuestaFinal = `${respuesta} Tu perfil calculado es "${perfil}". Ya generé una propuesta preliminar de portafolio, ¿quieres verla?`;
 
-      return res.status(200).json({
-        ok: true,
-        respuesta: respuestaFinal,
-        fase: "propuesta",
-        perfil,
-        sugerencias: ["Ver mi propuesta de portafolio"],
-      });
+        await Mensaje.create({
+          propietario_id: user.id,
+          user_id: user.id,
+          rol: "assistant",
+          contenido: respuestaFinal,
+          indice_orden: totalMensajes + 2,
+        });
+
+        return res.status(200).json({
+          ok: true,
+          respuesta: respuestaFinal,
+          fase: "propuesta",
+          perfil,
+          sugerencias: ["Ver mi propuesta de portafolio"],
+        });
+      } catch (error) {
+        console.error("[Perfilamiento] Error al guardar perfil/propuesta:", error);
+        return res.status(500).json({
+          ok: false,
+          mensaje: "Error al guardar el perfil o generar la propuesta.",
+          detalle: error.message,
+        });
+      }
     }
 
-    // ---- FASE: PROPUESTA ----
     if (sesion.tarea === "propuesta") {
       const contextoSesion = await obtenerContexto(sesion);
       const perfilRow = await PerfilInversionista.findByPk(contextoSesion.perfil_id);
       const propuestaRow = await PropuestaPortafolio.findByPk(contextoSesion.propuesta_id);
 
       if (!perfilRow || !propuestaRow) {
-        // Estado inconsistente: vuelve a levantar el perfil desde cero,
-        // reseteando solo las respuestas (no toca perfil_id/propuesta_id
-        // hasta que el nuevo perfilamiento los reemplace).
         await resetearRespuestas(sesion);
         await avanzarFase(sesion, "perfilamiento");
         return res.status(200).json({
@@ -435,6 +442,11 @@ export const enviarMensaje = async (req, res) => {
 
       const { respuesta, sugerencias = [] } = propuestaResult.parsed;
 
+      await propuestaRow.update({
+        justificacion: respuesta,
+        estado: "pendiente"
+      });
+
       await avanzarFase(sesion, "revision_asesor");
 
       const respuestaFinal = `${respuesta}\n\nEsta propuesta queda ahora pendiente de revisión por un asesor autorizado antes de cualquier ejecución.`;
@@ -455,9 +467,39 @@ export const enviarMensaje = async (req, res) => {
       });
     }
 
-    // ---- FASE: REVISIÓN POR ASESOR (esperando acción del asesor) ----
     if (sesion.tarea === "revision_asesor") {
-      const respuestaFinal = "Tu propuesta está pendiente de revisión por un asesor. Te avisaremos apenas sea aprobada, editada o rechazada.";
+      const contextoSesion = await obtenerContexto(sesion);
+      const propuesta = await PropuestaPortafolio.findByPk(contextoSesion.propuesta_id);
+      let respuestaFinal = '';
+
+      if (!propuesta) {
+        await resetearRespuestas(sesion);
+        await avanzarFase(sesion, "perfilamiento");
+        respuestaFinal = 'Parece que hubo un error con tu propuesta. Vamos a empezar de nuevo con tu perfil de inversionista. ¿Cuál es tu edad?';
+      } else {
+        switch (propuesta.estado) {
+          case 'pendiente':
+            respuestaFinal = 'Tu propuesta está pendiente de revisión por un asesor. Te avisaremos apenas sea aprobada, editada o rechazada. Mientras tanto, puedes preguntarme otras cosas.';
+            break;
+          case 'aprobada':
+            respuestaFinal = '¡Tu propuesta ha sido aprobada por el asesor! Ya puedes proceder con la ejecución (recuerda que es solo una recomendación, no una orden de compra). ¿Necesitas más información?';
+            break;
+          case 'rechazada': {
+            const ultimaRev = await PropuestaRevision.findOne({
+              where: { propuesta_id: propuesta.id, accion: 'rechazada' },
+              order: [['fecha_decision', 'DESC']]
+            });
+            const motivo = ultimaRev ? ` Motivo: ${ultimaRev.comentarios}` : '';
+            respuestaFinal = `Tu propuesta fue rechazada por el asesor.${motivo} ¿Te gustaría ajustar tu perfil y generar una nueva propuesta?`;
+            break;
+          }
+          case 'editada':
+            respuestaFinal = 'El asesor ha editado tu propuesta. Por favor, revísala nuevamente. ¿Quieres ver los cambios?';
+            break;
+          default:
+            respuestaFinal = 'Tu propuesta tiene un estado desconocido. Contacta al soporte.';
+        }
+      }
 
       await Mensaje.create({
         propietario_id: user.id,
@@ -471,11 +513,10 @@ export const enviarMensaje = async (req, res) => {
         ok: true,
         respuesta: respuestaFinal,
         fase: "revision_asesor",
-        sugerencias: ["Ver estado de mi propuesta"],
+        sugerencias: ["Ver estado de mi propuesta", "Volver a perfilamiento"]
       });
     }
 
-    // ---- FASE: COMPLETADO -> flujo libre de consultas (db_query / db_answer) ----
     const intencion_pendiente = contexto.intencion_pendiente || null;
     const resumen_anterior = contexto.resumen || null;
 
@@ -567,11 +608,7 @@ export const enviarMensaje = async (req, res) => {
       indice_orden: totalMensajes + 1,
     });
 
-    // ContextoUsuario.resumen sigue siendo un campo TEXT/STRING normal (no
-    // JSON), pensado para texto libre que resume la conversación. Se
-    // mantiene el truncado defensivo por las dudas, aunque el riesgo real
-    // de esta pantalla ya no está aquí sino que estaba en AgentSession.
-    const MAX_RESUMEN_BYTES = 20 * 1024; // 20KB
+    const MAX_RESUMEN_BYTES = 20 * 1024;
     let resumenAGuardar = nuevoResumen || resumen_anterior;
     if (resumenAGuardar && Buffer.byteLength(resumenAGuardar) > MAX_RESUMEN_BYTES) {
       console.warn(

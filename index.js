@@ -7,7 +7,7 @@ import { sequelize } from "./src/config/database.js";
 import "./src/models/relations.js";
 import financialAgentRouter from "./src/router/financialagent.route.js";
 import authRouter from "./src/router/auth.route.js";
-
+import asesorRouter from "./src/router/asesor.route.js";
 const app = express();
 const _PORT = PORT || 3000;
 
@@ -24,6 +24,7 @@ app.use(session({
 const api = express.Router();
 api.use(financialAgentRouter);
 api.use(authRouter);
+api.use(asesorRouter);
 app.use("/api", api);
 
 app.use((err, req, res, _next) => {
