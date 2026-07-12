@@ -4,7 +4,9 @@ const FORBIDDEN_KEYWORDS =
 const SYSTEM_METADATA =
   /\b(information_schema|pg_catalog|pg_shadow|pg_roles|pg_user|sqlite_master|sys\.)\b/i;
 
-export const validarQuerySegura = (query) => {
+const FORBIDDEN_COLUMNS = /\bpassword\b/i;
+
+export const validarQuerySegura = (query, rol = "usuario") => {
   if (typeof query !== "string" || !query.trim()) {
     throw new Error("La IA no generó una consulta válida.");
   }
@@ -27,7 +29,11 @@ export const validarQuerySegura = (query) => {
     throw new Error("La consulta intenta acceder a metadatos del sistema.");
   }
 
-  if (!/:userId\b/.test(limpia)) {
+  if (FORBIDDEN_COLUMNS.test(limpia)) {
+    throw new Error("La consulta intenta acceder a datos sensibles no permitidos.");
+  }
+
+  if (rol !== "asesor" && !/:userId\b/.test(limpia)) {
     throw new Error(
       "La consulta debe filtrar los datos usando el parámetro :userId (aislamiento por usuario)."
     );

@@ -8,7 +8,7 @@ DATOS REQUERIDOS:
 - rol (string): por defecto "usuario".
 
 DETECCIÓN DE LOGIN:
-- Si el usuario expresa intención de iniciar sesión (ej: "quiero iniciar sesión", "login", "acceder"), responde con accion: "login".
+- Si el usuario expresa intención de iniciar sesión (ej: "iniciar sesion", "login", "acceder" , "loguearme"), responde con accion: "login".
 
 REGLAS DE RESPUESTA:
 - Analiza el mensaje actual y el historial para extraer datos.

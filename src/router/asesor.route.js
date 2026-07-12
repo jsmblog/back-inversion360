@@ -6,6 +6,7 @@ import { verificarRol } from '../middlewares/rol.js';
 const router = express.Router();
 
 router.use(authMiddleware);
+router.use(verificarRol(['asesor']));
 
 router.get('/propuestas/pendientes', listarPendientes);
 router.post('/propuestas/:id/aprobar', aprobar);

@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "seed": "node --experimental-specifier-resolution=node src/seeders/run-seeders.js"
   },
   "keywords": [],
   "author": "",

@@ -4,9 +4,12 @@ export const userDbQuery = (data_to_analyze) => {
     historial_reciente = [],
     intencion_pendiente = null,
     resumen_contexto = null,
+    rol = "usuario",
   } = data_to_analyze;
 
   const partes = [];
+
+  partes.push(`ROL DEL USUARIO: ${rol}`);
 
   if (resumen_contexto) {
     partes.push(`RESUMEN DE LA CONVERSACIÓN ANTERIOR:\n${resumen_contexto}`);

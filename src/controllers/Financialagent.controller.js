@@ -64,6 +64,33 @@ export const obtenerTimeline = async (req, res) => {
   }
 };
 
+export const obtenerMisPropuestas = async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ ok: false, mensaje: 'No autenticado' });
+    }
+
+    const perfiles = await PerfilInversionista.findAll({
+      where: { user_id: user.id },
+      include: [
+        {
+          model: PropuestaPortafolio,
+          as: 'PropuestaPortafolios', 
+        },
+      ],
+      order: [['createdAt', 'DESC']],
+    });
+
+    const propuestas = perfiles.flatMap(p => p.PropuestaPortafolios || []);
+
+    return res.status(200).json({ ok: true, data: propuestas });
+  } catch (error) {
+    console.error('[obtenerMisPropuestas]', error);
+    return res.status(500).json({ ok: false, mensaje: 'Error al obtener propuestas' });
+  }
+};
+
 export const enviarMensaje = async (req, res) => {
   try {
     const { pregunta, provider, model, webSearch } = req.body;
@@ -106,6 +133,7 @@ export const enviarMensaje = async (req, res) => {
       contenido: m.contenido,
     }));
 
+    // ================= FLUJO ANÓNIMO: REGISTRO =================
     if (!req.user) {
       let datos_parciales = req.session.datos_registro || null;
 
@@ -121,7 +149,12 @@ export const enviarMensaje = async (req, res) => {
         });
       } catch (err) {
         console.error("[IA] Error en db_register:", err.message);
-        return res.status(500).json({ ok: false, mensaje: "Error al procesar el registro.", detalle: err.message });
+        return res.status(500).json({
+          ok: false,
+          mensaje: "Error al procesar el registro.",
+          detalle: err.message,
+          ownerId
+        });
       }
 
       if (!registerResult.isValid) {
@@ -130,6 +163,7 @@ export const enviarMensaje = async (req, res) => {
           mensaje: "Error al formatear la respuesta de registro.",
           detalle: registerResult.error,
           raw: registerResult.raw,
+          ownerId
         });
       }
 
@@ -158,6 +192,7 @@ export const enviarMensaje = async (req, res) => {
           respuesta: mensaje,
           registro_completado: false,
           sugerencias: datos_faltantes || [],
+          ownerId
         });
       }
 
@@ -167,6 +202,7 @@ export const enviarMensaje = async (req, res) => {
             ok: false,
             mensaje: "Faltan datos obligatorios para registrar.",
             datos_faltantes: ["name", "email", "password"],
+            ownerId
           });
         }
 
@@ -185,6 +221,7 @@ export const enviarMensaje = async (req, res) => {
             respuesta: mensajeError,
             registro_completado: false,
             sugerencias: ["Iniciar sesión", "Recuperar contraseña", "Usar otro correo"],
+            ownerId
           });
         }
 
@@ -252,13 +289,20 @@ export const enviarMensaje = async (req, res) => {
           redirigir: "/login",
           registro_completado: false,
           sugerencias: ["Ir a iniciar sesión", "Crear cuenta", "Recuperar contraseña"],
+          ownerId
         });
       }
 
-      return res.status(422).json({ ok: false, mensaje: "Acción no reconocida por el módulo de registro." });
+      return res.status(422).json({
+        ok: false,
+        mensaje: "Acción no reconocida por el módulo de registro.",
+        ownerId
+      });
     }
 
+    // ================= FLUJO AUTENTICADO =================
     const user = req.user;
+    const esAsesor = user.rol === "asesor";
     const [contexto] = await ContextoUsuario.findOrCreate({
       where: { user_id: user.id },
       defaults: { user_id: user.id },
@@ -267,7 +311,8 @@ export const enviarMensaje = async (req, res) => {
     const sesion = await obtenerOCrearSesion(user.id);
     const resumen_estado = await resumenEstado(sesion);
 
-    if (sesion.tarea === "perfilamiento") {
+    // ---- FASE: PERFILAMIENTO ---- (el asesor nunca entra aquí)
+    if (!esAsesor && sesion.tarea === "perfilamiento") {
       const contextoSesion = await obtenerContexto(sesion);
       const respuestas_parciales = {
         edad: contextoSesion.edad,
@@ -326,12 +371,7 @@ export const enviarMensaje = async (req, res) => {
             console.error("[AgentSessionContext] No se pudo guardar respuesta parcial:", err.message);
           }
         }
-        return res.status(200).json({
-          ok: true,
-          respuesta,
-          fase: "perfilamiento",
-          sugerencias,
-        });
+        return res.status(200).json({ ok: true, respuesta, fase: "perfilamiento", sugerencias });
       }
 
       const camposRequeridos = ["edad", "objetivo", "horizonte", "tolerancia_perdida", "ingresos", "experiencia"];
@@ -397,7 +437,8 @@ export const enviarMensaje = async (req, res) => {
       }
     }
 
-    if (sesion.tarea === "propuesta") {
+    // ---- FASE: PROPUESTA ---- (el asesor nunca entra aquí)
+    if (!esAsesor && sesion.tarea === "propuesta") {
       const contextoSesion = await obtenerContexto(sesion);
       const perfilRow = await PerfilInversionista.findByPk(contextoSesion.perfil_id);
       const propuestaRow = await PropuestaPortafolio.findByPk(contextoSesion.propuesta_id);
@@ -467,10 +508,12 @@ export const enviarMensaje = async (req, res) => {
       });
     }
 
-    if (sesion.tarea === "revision_asesor") {
+    // ---- FASE: REVISIÓN POR ASESOR ---- (el asesor nunca entra aquí)
+    if (!esAsesor && sesion.tarea === "revision_asesor") {
       const contextoSesion = await obtenerContexto(sesion);
       const propuesta = await PropuestaPortafolio.findByPk(contextoSesion.propuesta_id);
       let respuestaFinal = '';
+      let cerrarFase = false;
 
       if (!propuesta) {
         await resetearRespuestas(sesion);
@@ -483,6 +526,7 @@ export const enviarMensaje = async (req, res) => {
             break;
           case 'aprobada':
             respuestaFinal = '¡Tu propuesta ha sido aprobada por el asesor! Ya puedes proceder con la ejecución (recuerda que es solo una recomendación, no una orden de compra). ¿Necesitas más información?';
+            cerrarFase = true;
             break;
           case 'rechazada': {
             const ultimaRev = await PropuestaRevision.findOne({
@@ -491,6 +535,7 @@ export const enviarMensaje = async (req, res) => {
             });
             const motivo = ultimaRev ? ` Motivo: ${ultimaRev.comentarios}` : '';
             respuestaFinal = `Tu propuesta fue rechazada por el asesor.${motivo} ¿Te gustaría ajustar tu perfil y generar una nueva propuesta?`;
+            cerrarFase = true;
             break;
           }
           case 'editada':
@@ -499,6 +544,10 @@ export const enviarMensaje = async (req, res) => {
           default:
             respuestaFinal = 'Tu propuesta tiene un estado desconocido. Contacta al soporte.';
         }
+      }
+
+      if (cerrarFase) {
+        await avanzarFase(sesion, "completado");
       }
 
       await Mensaje.create({
@@ -512,11 +561,14 @@ export const enviarMensaje = async (req, res) => {
       return res.status(200).json({
         ok: true,
         respuesta: respuestaFinal,
-        fase: "revision_asesor",
-        sugerencias: ["Ver estado de mi propuesta", "Volver a perfilamiento"]
+        fase: cerrarFase ? "completado" : "revision_asesor",
+        sugerencias: cerrarFase
+          ? ["Hazme una pregunta sobre mis inversiones"]
+          : ["Ver estado de mi propuesta", "Volver a perfilamiento"]
       });
     }
 
+    // ---- FASE: COMPLETADO (flujo libre) ---- (el asesor entra siempre aquí)
     const intencion_pendiente = contexto.intencion_pendiente || null;
     const resumen_anterior = contexto.resumen || null;
 
@@ -528,6 +580,7 @@ export const enviarMensaje = async (req, res) => {
         intencion_pendiente,
         resumen_contexto: resumen_anterior,
         resumen_estado,
+        rol: user.rol,
         provider,
         model,
         webSearch,
@@ -541,7 +594,15 @@ export const enviarMensaje = async (req, res) => {
       return res.status(422).json({ ok: false, mensaje: "La IA no pudo procesar la solicitud.", detalle: queryResult.error });
     }
 
-    const { queryValida, razon, query } = queryResult.parsed;
+    let { queryValida, razon, query } = queryResult.parsed;
+
+    // Defensa en profundidad: si no es asesor, la query SIEMPRE debe filtrar por :userId
+    if (!esAsesor && queryValida && query && !query.includes(":userId")) {
+      console.warn(`[Seguridad] Query bloqueada por no filtrar :userId para user ${user.id}`);
+      queryValida = false;
+      razon = "La consulta generada no filtraba correctamente por el usuario y fue bloqueada por seguridad.";
+      query = null;
+    }
 
     let resultados = [];
     let total_filas = 0;
@@ -549,7 +610,7 @@ export const enviarMensaje = async (req, res) => {
 
     if (queryValida && query) {
       try {
-        const queryLimpia = validarQuerySegura(query);
+        const queryLimpia = validarQuerySegura(query, user.rol);
         resultados = await sequelize.query(queryLimpia, {
           replacements: { userId: user.id },
           type: sequelize.QueryTypes.SELECT,
@@ -574,6 +635,7 @@ export const enviarMensaje = async (req, res) => {
         generar_resumen: true,
         resumen_anterior,
         resumen_estado,
+        rol: user.rol,
         provider,
         model,
         webSearch,
