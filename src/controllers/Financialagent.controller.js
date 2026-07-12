@@ -1,30 +1,35 @@
+import jwt from "jsonwebtoken";
+import bcrypt from "bcrypt";
+import { v4 as uuidv4 } from "uuid";
 import { sequelize } from "../config/database.js";
-import { Mensaje, ContextoUsuario, User } from "../models/relations.js";
+import { Mensaje, ContextoUsuario, User, PerfilInversionista, PropuestaPortafolio } from "../models/relations.js";
 import { execute } from "../ai/execute.js";
 import { validarQuerySegura } from "../utils/sqlguard.js";
-import { v4 as uuidv4 } from 'uuid';
-import bcrypt from "bcrypt";
+import { calcularPerfil, generarPropuesta } from "../utils/perfilamiento.js";
+import {
+  obtenerOCrearSesion,
+  obtenerContexto,
+  registrarEvento,
+  avanzarFase,
+  resumenEstado,
+  actualizarContexto,
+  resetearRespuestas,
+  obtenerHistorialPaginado,
+} from "../services/agentSessionService.js";
 
 const MENSAJES_DE_CONTEXTO = 10;
-
-function getEstadoPerfil(req) {
-  if (!req.session.estado_perfil) {
-    req.session.estado_perfil = {
-      paso: 0, // 0 a 5
-      respuestas: {},
-      completado: false,
-    };
-  }
-  return req.session.estado_perfil;
-}
+const SALT_ROUNDS = 10;
 
 export const obtenerConversacion = async (req, res) => {
   try {
+    const ownerId = req.user ? req.user.id : req.session?.ownerId;
+    if (!ownerId) {
+      return res.status(200).json({ ok: true, autenticado: false, data: [] });
+    }
     const mensajes = await Mensaje.findAll({
-      where: { propietario_id: req.ownerId },
+      where: { propietario_id: ownerId },
       order: [["indice_orden", "ASC"]],
     });
-
     return res.status(200).json({ ok: true, autenticado: !!req.user, data: mensajes });
   } catch (err) {
     console.error("[obtenerConversacion]", err.message);
@@ -32,7 +37,32 @@ export const obtenerConversacion = async (req, res) => {
   }
 };
 
-const SALT_ROUNDS = 10;
+export const obtenerTimeline = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ ok: false, mensaje: "Debes iniciar sesión para ver tu timeline." });
+    }
+    const sesion = await obtenerOCrearSesion(req.user.id);
+
+    const { limit, before } = req.query;
+    const limiteAplicado = limit ? Math.min(Number(limit), 100) : 50;
+
+    const eventos = await obtenerHistorialPaginado(sesion, {
+      limit: limiteAplicado,
+      before: before ? new Date(before) : null,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      fase_actual: sesion.tarea,
+      historial: eventos.reverse(),
+      hay_mas: eventos.length === limiteAplicado,
+    });
+  } catch (err) {
+    console.error("[obtenerTimeline]", err.message);
+    return res.status(500).json({ ok: false, mensaje: "Error al obtener el timeline.", detalle: err.message });
+  }
+};
 
 export const enviarMensaje = async (req, res) => {
   try {
@@ -41,8 +71,10 @@ export const enviarMensaje = async (req, res) => {
       return res.status(400).json({ ok: false, mensaje: "'pregunta' es obligatoria." });
     }
 
-    let ownerId = req.ownerId;
-    if (!req.user) {
+    let ownerId;
+    if (req.user) {
+      ownerId = req.user.id;
+    } else {
       if (!req.session.ownerId) {
         req.session.ownerId = uuidv4();
       }
@@ -74,6 +106,7 @@ export const enviarMensaje = async (req, res) => {
       contenido: m.contenido,
     }));
 
+    // ================= FLUJO ANÓNIMO: REGISTRO =================
     if (!req.user) {
       let datos_parciales = req.session.datos_registro || null;
 
@@ -170,16 +203,31 @@ export const enviarMensaje = async (req, res) => {
           { where: { propietario_id: ownerId } }
         );
 
+        // Emite JWT igual que en login para que el frontend lo guarde y lo
+        // mande en el header Authorization desde el siguiente mensaje.
+        const token = jwt.sign(
+          { id: newUser.id, email: newUser.email, rol: newUser.rol },
+          process.env.JWT_SECRET,
+          { expiresIn: "7d" }
+        );
+
+        req.user = { id: newUser.id, email: newUser.email, rol: newUser.rol };
+
         await ContextoUsuario.create({
           user_id: newUser.id,
           resumen: null,
           intencion_pendiente: null,
         });
 
+        // Crea la sesión de agente ya en fase "perfilamiento" (esto también
+        // crea la fila 1:1 en AgentSessionContext, vacía y lista).
+        const sesionNueva = await obtenerOCrearSesion(newUser.id);
+        await registrarEvento(sesionNueva, "usuario_registrado", { email: newUser.email });
+
         req.session.datos_registro = null;
         req.session.ownerId = null;
 
-        const mensajeExito = `¡Registro completado! Bienvenido, ${newUser.name}. Ahora puedes realizar consultas financieras. ¿En qué puedo ayudarte?`;
+        const mensajeExito = `¡Registro completado! Bienvenido, ${newUser.name}. Ahora vamos a completar tu perfil de inversionista para poder darte una propuesta adecuada. ¿Cuál es tu edad?`;
         await Mensaje.create({
           propietario_id: newUser.id,
           user_id: newUser.id,
@@ -192,7 +240,15 @@ export const enviarMensaje = async (req, res) => {
           ok: true,
           respuesta: mensajeExito,
           registro_completado: true,
-          sugerencias: ["Ver mi saldo", "Últimos movimientos", "Crear meta de ahorro"],
+          fase: "perfilamiento",
+          token,
+          usuario: {
+            id: newUser.id,
+            name: newUser.name,
+            email: newUser.email,
+            rol: newUser.rol,
+          },
+          sugerencias: [],
         });
       } else if (accion === "login") {
         return res.status(200).json({
@@ -207,12 +263,219 @@ export const enviarMensaje = async (req, res) => {
       return res.status(422).json({ ok: false, mensaje: "Acción no reconocida por el módulo de registro." });
     }
 
+    // ================= FLUJO AUTENTICADO =================
     const user = req.user;
     const [contexto] = await ContextoUsuario.findOrCreate({
       where: { user_id: user.id },
       defaults: { user_id: user.id },
     });
 
+    const sesion = await obtenerOCrearSesion(user.id);
+    const resumen_estado = await resumenEstado(sesion);
+
+    // ---- FASE: PERFILAMIENTO ----
+    if (sesion.tarea === "perfilamiento") {
+      const contextoSesion = await obtenerContexto(sesion);
+      const respuestas_parciales = {
+        edad: contextoSesion.edad,
+        objetivo: contextoSesion.objetivo,
+        horizonte: contextoSesion.horizonte,
+        tolerancia_perdida: contextoSesion.tolerancia_perdida,
+        ingresos: contextoSesion.ingresos,
+        experiencia: contextoSesion.experiencia,
+      };
+      // No mandamos claves nulas al prompt, para no confundir al modelo.
+      Object.keys(respuestas_parciales).forEach((k) => {
+        if (respuestas_parciales[k] === null || respuestas_parciales[k] === undefined) {
+          delete respuestas_parciales[k];
+        }
+      });
+
+      let perfilResult;
+      try {
+        perfilResult = await execute("db_perfil", {
+          pregunta,
+          historial_reciente,
+          respuestas_parciales,
+          resumen_estado,
+          provider,
+          model,
+          webSearch,
+        });
+      } catch (err) {
+        console.error("[IA] Error en db_perfil:", err.message);
+        return res.status(500).json({ ok: false, mensaje: "Error al procesar el perfilamiento.", detalle: err.message });
+      }
+
+      if (!perfilResult.isValid) {
+        return res.status(422).json({
+          ok: false,
+          mensaje: "Error al formatear la respuesta de perfilamiento.",
+          detalle: perfilResult.error,
+          raw: perfilResult.raw,
+        });
+      }
+
+      const { respuesta, perfil_completado, respuestas, sugerencias = [] } = perfilResult.parsed;
+
+      await Mensaje.create({
+        propietario_id: user.id,
+        user_id: user.id,
+        rol: "assistant",
+        contenido: respuesta,
+        indice_orden: totalMensajes + 1,
+      });
+
+      if (!perfil_completado) {
+        // Antes: merge de un JSON libre sin límite. Ahora: solo se
+        // escriben los campos tipados que el modelo haya devuelto; el
+        // resto de las respuestas ya guardadas quedan intactas sin
+        // necesidad de "traerlas y volver a mandarlas".
+        if (respuestas && Object.keys(respuestas).length > 0) {
+          try {
+            await actualizarContexto(sesion, respuestas);
+          } catch (err) {
+            // Un valor fuera de rango (p. ej. texto más largo del permitido
+            // en una columna) ya no puede tumbar toda la sesión: se loguea
+            // y la conversación sigue. En el peor caso, esa respuesta
+            // puntual no quedó guardada y se le vuelve a preguntar.
+            console.error("[AgentSessionContext] No se pudo guardar respuesta parcial:", err.message);
+          }
+        }
+        return res.status(200).json({ ok: true, respuesta, fase: "perfilamiento", sugerencias });
+      }
+
+      // Perfil completo: calcular score con reglas (no con IA) y crear propuesta
+      const { score, perfil, version } = calcularPerfil(respuestas);
+      const perfilCreado = await PerfilInversionista.create({
+        user_id: user.id,
+        ...respuestas,
+        score,
+        perfil,
+        version_reglas: version,
+      });
+
+      const propuestaCalculada = generarPropuesta(perfil);
+      const propuestaCreada = await PropuestaPortafolio.create({
+        perfil_id: perfilCreado.id,
+        ...propuestaCalculada,
+      });
+
+      await avanzarFase(sesion, "propuesta", {
+        perfil_id: perfilCreado.id,
+        propuesta_id: propuestaCreada.id,
+      });
+      await registrarEvento(sesion, "perfil_calculado", { perfil, score });
+
+      const respuestaFinal = `${respuesta} Tu perfil calculado es "${perfil}". Ya generé una propuesta preliminar de portafolio, ¿quieres verla?`;
+
+      await Mensaje.create({
+        propietario_id: user.id,
+        user_id: user.id,
+        rol: "assistant",
+        contenido: respuestaFinal,
+        indice_orden: totalMensajes + 2,
+      });
+
+      return res.status(200).json({
+        ok: true,
+        respuesta: respuestaFinal,
+        fase: "propuesta",
+        perfil,
+        sugerencias: ["Ver mi propuesta de portafolio"],
+      });
+    }
+
+    // ---- FASE: PROPUESTA ----
+    if (sesion.tarea === "propuesta") {
+      const contextoSesion = await obtenerContexto(sesion);
+      const perfilRow = await PerfilInversionista.findByPk(contextoSesion.perfil_id);
+      const propuestaRow = await PropuestaPortafolio.findByPk(contextoSesion.propuesta_id);
+
+      if (!perfilRow || !propuestaRow) {
+        // Estado inconsistente: vuelve a levantar el perfil desde cero,
+        // reseteando solo las respuestas (no toca perfil_id/propuesta_id
+        // hasta que el nuevo perfilamiento los reemplace).
+        await resetearRespuestas(sesion);
+        await avanzarFase(sesion, "perfilamiento");
+        return res.status(200).json({
+          ok: true,
+          respuesta: "Parece que necesito volver a levantar tu perfil de inversionista. ¿Cuál es tu edad?",
+          fase: "perfilamiento",
+          sugerencias: [],
+        });
+      }
+
+      let propuestaResult;
+      try {
+        propuestaResult = await execute("db_propuesta", {
+          pregunta,
+          perfil: perfilRow.perfil,
+          instrumentos: propuestaRow.instrumentos,
+          riesgo_esperado: propuestaRow.riesgo_esperado,
+          historial_reciente,
+          resumen_estado,
+          provider,
+          model,
+          webSearch,
+        });
+      } catch (err) {
+        console.error("[IA] Error en db_propuesta:", err.message);
+        return res.status(500).json({ ok: false, mensaje: "Error al explicar la propuesta.", detalle: err.message });
+      }
+
+      if (!propuestaResult.isValid) {
+        return res.status(422).json({
+          ok: false,
+          mensaje: "Error al formatear la explicación de la propuesta.",
+          detalle: propuestaResult.error,
+          raw: propuestaResult.raw,
+        });
+      }
+
+      const { respuesta, sugerencias = [] } = propuestaResult.parsed;
+
+      await avanzarFase(sesion, "revision_asesor");
+
+      const respuestaFinal = `${respuesta}\n\nEsta propuesta queda ahora pendiente de revisión por un asesor autorizado antes de cualquier ejecución.`;
+
+      await Mensaje.create({
+        propietario_id: user.id,
+        user_id: user.id,
+        rol: "assistant",
+        contenido: respuestaFinal,
+        indice_orden: totalMensajes + 1,
+      });
+
+      return res.status(200).json({
+        ok: true,
+        respuesta: respuestaFinal,
+        fase: "revision_asesor",
+        sugerencias,
+      });
+    }
+
+    // ---- FASE: REVISIÓN POR ASESOR (esperando acción del asesor) ----
+    if (sesion.tarea === "revision_asesor") {
+      const respuestaFinal = "Tu propuesta está pendiente de revisión por un asesor. Te avisaremos apenas sea aprobada, editada o rechazada.";
+
+      await Mensaje.create({
+        propietario_id: user.id,
+        user_id: user.id,
+        rol: "assistant",
+        contenido: respuestaFinal,
+        indice_orden: totalMensajes + 1,
+      });
+
+      return res.status(200).json({
+        ok: true,
+        respuesta: respuestaFinal,
+        fase: "revision_asesor",
+        sugerencias: ["Ver estado de mi propuesta"],
+      });
+    }
+
+    // ---- FASE: COMPLETADO -> flujo libre de consultas (db_query / db_answer) ----
     const intencion_pendiente = contexto.intencion_pendiente || null;
     const resumen_anterior = contexto.resumen || null;
 
@@ -223,6 +486,7 @@ export const enviarMensaje = async (req, res) => {
         historial_reciente,
         intencion_pendiente,
         resumen_contexto: resumen_anterior,
+        resumen_estado,
         provider,
         model,
         webSearch,
@@ -268,6 +532,7 @@ export const enviarMensaje = async (req, res) => {
         intencion_pendiente,
         generar_resumen: true,
         resumen_anterior,
+        resumen_estado,
         provider,
         model,
         webSearch,
@@ -302,14 +567,28 @@ export const enviarMensaje = async (req, res) => {
       indice_orden: totalMensajes + 1,
     });
 
+    // ContextoUsuario.resumen sigue siendo un campo TEXT/STRING normal (no
+    // JSON), pensado para texto libre que resume la conversación. Se
+    // mantiene el truncado defensivo por las dudas, aunque el riesgo real
+    // de esta pantalla ya no está aquí sino que estaba en AgentSession.
+    const MAX_RESUMEN_BYTES = 20 * 1024; // 20KB
+    let resumenAGuardar = nuevoResumen || resumen_anterior;
+    if (resumenAGuardar && Buffer.byteLength(resumenAGuardar) > MAX_RESUMEN_BYTES) {
+      console.warn(
+        `[ContextoUsuario] resumen excede ${MAX_RESUMEN_BYTES} bytes para user ${user.id}, truncando.`
+      );
+      resumenAGuardar = resumenAGuardar.slice(0, MAX_RESUMEN_BYTES);
+    }
+
     await contexto.update({
       intencion_pendiente: nuevaIntencion,
-      resumen: nuevoResumen || resumen_anterior,
+      resumen: resumenAGuardar,
     });
 
     return res.status(200).json({
       ok: true,
       respuesta,
+      fase: "completado",
       tiene_datos,
       sugerencias,
       debug: {

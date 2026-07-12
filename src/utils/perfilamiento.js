@@ -35,7 +35,7 @@ export function calcularPerfil(respuestas) {
     scoreTotal += puntaje * p.ponderacion;
     maxScore += 5 * p.ponderacion;
   }
-  const scoreNormalizado = (scoreTotal / maxScore) * 100; // 0-100
+  const scoreNormalizado = (scoreTotal / maxScore) * 100;
 
   let perfil;
   if (scoreNormalizado < 40) perfil = "conservador";
@@ -48,10 +48,8 @@ export function calcularPerfil(respuestas) {
 export function generarPropuesta(perfil) {
   const asignacion = ASIGNACIONES[perfil];
   const instrumentosSeleccionados = [];
-  // Elegir instrumentos según categoría
   for (const [categoria, porcentaje] of Object.entries(asignacion)) {
     const disponibles = CATALOGO_INSTRUMENTOS.filter(i => i.categoria === categoria);
-    // Simple: tomar el primero de la categoría (o distribuir)
     if (disponibles.length > 0) {
       const instrumento = disponibles[0];
       instrumentosSeleccionados.push({
@@ -62,7 +60,6 @@ export function generarPropuesta(perfil) {
       });
     }
   }
-  // Riesgo esperado (promedio ponderado)
   const riesgoMap = { bajo: 1, medio: 3, alto: 5 };
   let riesgoPonderado = 0;
   for (const item of instrumentosSeleccionados) {

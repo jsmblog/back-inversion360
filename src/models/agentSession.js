@@ -24,14 +24,6 @@ const AgentSession = sequelize.define("AgentSession", {
     type: DataTypes.ENUM("en_progreso", "completado", "cancelado"),
     defaultValue: "en_progreso",
   },
-  contexto: {
-    type: DataTypes.JSON,
-    defaultValue: {},
-  },
-  historial: {
-    type: DataTypes.JSON,
-    defaultValue: [],
-  },
 }, {
   tableName: "agent_sessions",
   timestamps: true,
