@@ -9,7 +9,7 @@ export const DB_PASSWORD = process.env.DB_PASSWORD;
 export const DB_NAME = process.env.DB_NAME;
 export const JWT_SECRET = process.env.JWT_SECRET;
 export const DB_CONNECTION = process.env.DB_CONNECTION
-
+export const SESSION_SECRET = process.env.SESSION_SECRET
 
 export const API_KEY_DEEPSEEK = process.env.API_KEY_DEEPSEEK;
 export const API_KEY_CLAUDE = process.env.API_KEY_CLAUDE;
