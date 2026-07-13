@@ -13,3 +13,4 @@ export const SESSION_SECRET = process.env.SESSION_SECRET
 
 export const API_KEY_DEEPSEEK = process.env.API_KEY_DEEPSEEK;
 export const API_KEY_CLAUDE = process.env.API_KEY_CLAUDE;
+export const NODE_ENV = process.env.NODE_ENV;

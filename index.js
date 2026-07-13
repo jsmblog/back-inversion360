@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import session from "express-session";
-import { PORT, SESSION_SECRET } from "./src/config/config.js";
+import { NODE_ENV, PORT, SESSION_SECRET } from "./src/config/config.js";
 import { corsOption } from "./src/config/corsOption.js";
 import { sequelize } from "./src/config/database.js";
 import "./src/models/relations.js";
@@ -10,15 +10,19 @@ import authRouter from "./src/router/auth.route.js";
 import asesorRouter from "./src/router/asesor.route.js";
 const app = express();
 const _PORT = PORT || 3000;
-
 app.use(express.json());
 app.use(cors(corsOption));
 
+app.set("trust proxy", 1);
 app.use(session({
   secret: SESSION_SECRET || "mi-secreto-temporal",
   resave: false,
   saveUninitialized: true,
-  cookie: { secure: false }
+  cookie: {
+    secure: NODE_ENV === "production",
+    sameSite:NODE_ENV === "production" ? "none" : "lax",
+    maxAge: 1000 * 60 * 60 * 24, 
+  },
 }));
 
 const api = express.Router();
