@@ -1,5 +1,5 @@
 import { Sequelize } from 'sequelize';
-import {DB_NAME,DB_USERNAME,DB_PASSWORD,DB_HOST,DB_CONNECTION} from './config.js';
+import { DB_NAME, DB_USERNAME, DB_PASSWORD, DB_HOST, DB_CONNECTION } from './config.js';
 
 export const sequelize = new Sequelize(
     DB_NAME,
@@ -7,6 +7,12 @@ export const sequelize = new Sequelize(
     DB_PASSWORD,
     {
         host: DB_HOST,
-        dialect: DB_CONNECTION
+        dialect: DB_CONNECTION,
+        dialectOptions: {
+            ssl: {
+                require: true,
+                rejectUnauthorized: false, 
+            }
+        }
     }
 );
